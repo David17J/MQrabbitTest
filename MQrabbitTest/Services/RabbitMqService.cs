@@ -1,42 +1,84 @@
 ﻿using RabbitMQ.Client;
 using System.Text;
+using RabbitMQ.Client.Exceptions;
+using Microsoft.Extensions.Logging;
 
 namespace MQrabbitTest.Services // <--- an deinen Projektnamespace anpassen!
 {
     public class RabbitMqService
     {
         private readonly ConnectionFactory _factory;
+        private readonly ILogger<RabbitMqService> _logger;
+        private const int MaxRetries = 3;
+        private const int RetryDelayMs = 1000;
 
-        public RabbitMqService()
+        public RabbitMqService(ILogger<RabbitMqService> logger)
         {
-            // Passe hier den HostName an!
+            _logger = logger;
             _factory = new ConnectionFactory() { 
-                HostName = "localhost" ,
+                HostName = "rabbitmq",
                 UserName = "guest",
-                Password = "guest"
-            
+                Password = "guest",
+                RequestedHeartbeat = TimeSpan.FromSeconds(60),
+                AutomaticRecoveryEnabled = true,
+                NetworkRecoveryInterval = TimeSpan.FromSeconds(10)
             };
     
             // Wenn du aus Docker heraus zugreifst: HostName = "host.docker.internal"
             // Wenn beide Container im selben Netz: HostName = "rabbitmq"
         }
 
-        public async void SendMessage(string queue, string message)
+        public async Task<bool> SendMessageAsync(string queue, string message, string exchange = "", string routingKey = "")
         {
-            using var connection = await _factory.CreateConnectionAsync();
-            using var channel = await connection.CreateChannelAsync();
+            int retryCount = 0;
+            while (retryCount < MaxRetries)
+            {
+                try
+                {
+                    using var connection = _factory.CreateConnection();
+                    using var channel = connection.CreateModel();
 
+                    // Declare queue with more durability options
+                    channel.QueueDeclare(
+                        queue: queue,
+                        durable: true,
+                        exclusive: false,
+                        autoDelete: false,
+                        arguments: null);
 
-            await channel.QueueDeclareAsync(queue: queue, durable: false, exclusive: false, autoDelete: false,
-    arguments: null);
+                    var properties = channel.CreateBasicProperties();
+                    properties.Persistent = true; // Message persistence
+                    properties.DeliveryMode = 2; // Persistent
 
-           // channel.QueueDeclare(queue: queue, durable: false, exclusive: false, autoDelete: false, arguments: null);
+                    var body = Encoding.UTF8.GetBytes(message);
+                    
+                    channel.BasicPublish(
+                        exchange: exchange,
+                        routingKey: string.IsNullOrEmpty(routingKey) ? queue : routingKey,
+                        mandatory: true,
+                        basicProperties: properties,
+                        body: body);
 
-            var body = Encoding.UTF8.GetBytes(message);
-            await channel.BasicPublishAsync(exchange: string.Empty, routingKey: "hello", body: body);
-            //Console.WriteLine(body);
+                    _logger.LogInformation($"Message sent successfully to queue: {queue}");
+                    return true;
+                }
+                catch (BrokerUnreachableException ex)
+                {
+                    _logger.LogWarning($"RabbitMQ broker unreachable. Attempt {retryCount + 1} of {MaxRetries}. Error: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Error sending message to queue {queue}. Attempt {retryCount + 1} of {MaxRetries}. Error: {ex.Message}");
+                }
 
-            // channel.BasicPublish(exchange: "", routingKey: queue, basicProperties: null, body: body);
+                retryCount++;
+                if (retryCount < MaxRetries)
+                {
+                    await Task.Delay(RetryDelayMs * retryCount);
+                }
+            }
+
+            return false;
         }
     }
 }
